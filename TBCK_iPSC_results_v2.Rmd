@@ -1,0 +1,266 @@
+---
+title: "TBCK_iPSC_diff_expression"
+author: "Victor Toledo"
+date: '2022-05-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Comparação da expressão de RNA entre neurônios/NSC de pacientes TBCK(-) e controles
+
+```{r message = FALSE, warning = TRUE, echo = FALSE}
+library(DESeq2)
+library(tximport)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(rmarkdown)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(ggplot2)
+```
+## Neurônios primeiro
+- Criar a matriz design que diz quais amostras são controle e quais são TBCK(-)
+- Importar as quantificações de transcritos e transformá-los em counts de genes
+
+```{r message = FALSE}
+setwd("/home/victor/Documentos/TBCK_iPSC_project/diff_expression/_h")
+samples <- data.frame(
+  condition = c("control", "control", "TBCK", "TBCK"),
+  row.names = c("MRP-F6331-1-Neuron_S5_", "MRP-F6331-4-Neuron_S6_", "MRP-F7007-1-Neuron_S7_", "MRP-F8799-1-Neuron_S8_")
+)
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene # Essa versão é o release 39, diferente do que usamos pra indexar. Talvez valha a pena indexar com o 39
+k <- keys(txdb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(txdb, k, "GENEID", "TXNAME")
+tx2gene <- na.omit(tx2gene) # Isso pode ser importante! Talvez trocar pra ENSEMBL GENE, mas depois também tem a questão de perder pro enriquecimento
+
+files <- paste0(row.names(samples),"quant.sf")
+names(files) <- c("MRP-F6331-1-Neuron_S5_", "MRP-F6331-4-Neuron_S6_", "MRP-F7007-1-Neuron_S7_", "MRP-F8799-1-Neuron_S8_")
+all(file.exists(files))
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+```
+-Criação do objeto DESeq2 para avaliar diferença de expressão, testando o `apeglm` shrinkage e usando o `lfcThreshold` para fazer a hipótese alternativa ser mais restrita (ainda preciso estudar melhor essa parte)
+
+```{r}
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~condition)
+dds <- DESeq(dds)
+res <- lfcShrink(dds, coef = "condition_TBCK_vs_control", type = "apeglm", lfcThreshold = 0.5)
+```
+### Tabela com resultados totais neurônios
+
+```{r}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "TBCK"))
+paged_table(formated_res)
+write.table(formated_res, file = "~/Documentos/TBCK_iPSC_project/diff_expression/_m/neuron_TBCK_iPSC_diff_genes_v2.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+Quantos são significativos e quantos não são?
+```{r}
+table(formated_res$significative)
+```
+
+#### Visualização
+
+```{r}
+plotMA(res)
+```
+
+```{r}
+vsd <- vst(dds, blind = TRUE)
+plotPCA(vsd, intgroup = "condition")
+```
+
+
+```{r}
+select <- order(rowMeans(counts(dds, normalized = TRUE)), decreasing = TRUE)[1:5000]
+df <- as.data.frame(colData(dds))
+pheatmap(assay(vsd)[select, ],
+  cluster_rows = TRUE,
+  show_rownames = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = df,
+  border_color = NA,
+  color = cividis(256),
+  scale = "row"
+)
+```
+
+#### Tabela com os significativos e suas informações
+```{r}
+sig <- subset(formated_res, significative == "yes")
+sig
+```
+
+#### Enriquecimentos com o clusterProfiler: GO
+```{r}
+universe <- formated_res$gene
+x <- sig$gene
+ego_BP <- enrichGO(gene     = x, #Biological Process
+                     universe      = universe,
+                     OrgDb         = org.Hs.eg.db,
+                     ont           = "BP",
+                     keyType       = 'ENTREZID',
+                     pAdjustMethod = "fdr",
+                     pvalueCutoff  = 0.05,
+                     qvalueCutoff = 0.05,
+                     minGSSize=5)
+```
+
+#### Enriquecimentos com o clusterProfiler: KEGG
+```{r}
+kk <- enrichKEGG(gene         = x,
+                   organism     = 'hsa',
+                   universe = universe,
+                   pAdjustMethod = "fdr",
+                   pvalueCutoff  = 0.05)
+```
+
+#### Enriquecimentos com o clusterProfiler: Reactome
+```{r}
+reactome <- enrichPathway(gene= x,
+                        organism = "human",
+                        universe = universe,
+                        pAdjustMethod = "fdr",
+                        pvalueCutoff=0.05)
+```
+
+### Plotando os gráficos de enriquecimento
+#### KEGG
+```{r}
+require(DOSE)
+dotplot(kk)
+```
+
+#### Reactome
+```{r}
+reactome@result$Description <- gsub("Homo sapiens\r: ","",reactome@result$Description)
+dotplot(reactome, font.size = 10)
+```
+
+Para salvar os plots
+```{r}
+pdf("~/Documentos/TBCK_iPSC_project/diff_expression/_m/KEGG_enrichment_neuron_TBCKvsCONTROL.pdf", width = 6, height = 7)
+dotplot(kk, font.size = 10)
+dev.off()
+
+pdf("~/Documentos/TBCK_iPSC_project/diff_expression/_m/REACTOME_enrichment_neuron_TBCKvsCONTROL.pdf", width = 6, height = 7)
+dotplot(reactome, font.size = 10)
+dev.off()
+```
+
+## Agora com NSC, os mesmos passos
+#### Automatização virá depois
+
+```{r message = FALSE}
+setwd("/home/victor/Documentos/TBCK_iPSC_project/diff_expression/_h")
+samples2 <- data.frame(
+  condition = c("control", "control", "TBCK", "TBCK"),
+  row.names = c("MRP-F6331-1-NSC_S1_", "MRP-F6331-4-NSC_S2_", "MRP-F7007-1-NSC_S3_", "MRP-F8799-1-NSC_S4_")
+)
+
+files2 <- paste0(row.names(samples2),"quant.sf")
+names(files2) <- c("MRP-F6331-1-NSC_S1_", "MRP-F6331-4-NSC_S2_", "MRP-F7007-1-NSC_S3_", "MRP-F8799-1-NSC_S4_")
+all(file.exists(files2))
+
+txi2 <- tximport(files2, type = "salmon", tx2gene = tx2gene)
+```
+#### DESeq2
+
+```{r}
+dds2 <- DESeqDataSetFromTximport(txi2, colData = samples2, design = ~condition)
+dds2 <- DESeq(dds2)
+res2 <- lfcShrink(dds2, coef = "condition_TBCK_vs_control", type = "apeglm", lfcThreshold = 0.5)
+```
+
+### Tabela de resultados NSC
+
+```{r}
+formated_res2 <- as.data.frame(res2) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "TBCK"))
+paged_table(formated_res2)
+write.table(formated_res2, file = "~/Documentos/TBCK_iPSC_project/diff_expression/_m/NSC_TBCK_iPSC_diff_genes_v2.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+```{r}
+table(formated_res2$significative)
+```
+
+#### Visualização
+
+```{r}
+plotMA(res2)
+```
+
+```{r}
+vsd2 <- vst(dds2, blind = TRUE)
+plotPCA(vsd2, intgroup = "condition")
+```
+
+
+```{r}
+select2 <- order(rowMeans(counts(dds2, normalized = TRUE)), decreasing = TRUE)[1:5000]
+df2 <- as.data.frame(colData(dds2))
+pheatmap(assay(vsd2)[select2, ],
+  cluster_rows = TRUE,
+  show_rownames = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = df2,
+  border_color = NA,
+  color = cividis(256),
+  scale = "row"
+)
+```
+
+### Tabela com os significativos e suas informações
+```{r}
+sig2 <- subset(formated_res2, significative == "yes")
+sig2
+```
+
+#### Enriquecimentos com o clusterProfiler: GO
+```{r}
+universe2 <- formated_res2$gene
+x2 <- sig2$gene
+ego_BP2 <- enrichGO(gene     = x2, #Biological Process
+                     universe      = universe2,
+                     OrgDb         = org.Hs.eg.db,
+                     ont           = "BP",
+                     keyType       = 'ENTREZID',
+                     pAdjustMethod = "fdr",
+                     pvalueCutoff  = 0.05,
+                     qvalueCutoff = 0.05,
+                     minGSSize=5)
+```
+
+#### Enriquecimentos com o clusterProfiler: KEGG
+```{r}
+kk2 <- enrichKEGG(gene         = x2,
+                   organism     = 'hsa',
+                   universe = universe2,
+                   pAdjustMethod = "fdr",
+                   pvalueCutoff  = 0.05)
+```
+
+#### Enriquecimentos com o clusterProfiler: Reactome
+```{r}
+reactome2 <- enrichPathway(gene= x2,
+                        organism = "human",
+                        universe = universe2,
+                        pAdjustMethod = "fdr",
+                        pvalueCutoff=0.05)
+```
+
+Nenhum enriquecimento com p-valor ajustado < 0.05 para os NSC.
